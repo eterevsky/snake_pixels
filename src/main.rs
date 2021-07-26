@@ -1,5 +1,6 @@
 use log::{debug, error, info};
 use pixels::{Pixels, PixelsBuilder, SurfaceTexture};
+use rand::Rng;
 use std::{
     cell::Cell,
     collections::{HashSet, VecDeque},
@@ -65,7 +66,7 @@ impl Canvas {
             width: width as usize,
             height: height as usize,
             pixels,
-            frame_times: VecDeque::new()
+            frame_times: VecDeque::new(),
         })
     }
 
@@ -84,7 +85,9 @@ impl Canvas {
 
     fn draw(&mut self) -> Result<(), ()> {
         self.update_fps();
-        self.pixels.render().map_err(|e| {error!("Pixels error: {}", e);})
+        self.pixels.render().map_err(|e| {
+            error!("Pixels error: {}", e);
+        })
     }
 
     fn clear(&mut self, color: Color) {
@@ -123,7 +126,7 @@ impl Canvas {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Hash)]
 struct Vec2(i32, i32);
 
 impl std::ops::AddAssign for Vec2 {
@@ -133,13 +136,32 @@ impl std::ops::AddAssign for Vec2 {
     }
 }
 
+impl std::ops::Add for Vec2 {
+    type Output = Vec2;
+
+    fn add(self, other: Self) -> Self {
+        Vec2(self.0 + other.0, self.1 + other.1)
+    }
+}
+
+impl std::cmp::PartialEq for Vec2 {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0 && self.1 == other.1
+    }
+}
+
+impl std::cmp::Eq for Vec2 {}
+
 const BG_COLOR: Color = Color::rgb(0x48, 0xB2, 0xE8);
 const HEAD_COLOR: Color = Color::rgb(0x4E, 0x38, 0xE8);
 const TAIL_COLOR: Color = Color::rgb(0x5E, 0x48, 0xE8);
+const FOOD_COLOR: Color = Color::rgb(0x9E, 0x28, 0xE8);
 
 struct State {
     tick: Duration,
+    food_tick: Duration,
     next_update: Instant,
+    next_food: Instant,
     fps_update: Cell<Instant>,
 
     width: i32,
@@ -153,9 +175,12 @@ struct State {
 impl State {
     fn new() -> Self {
         let tick = Duration::from_millis(400);
+        let food_tick = Duration::from_millis(1500);
         State {
             tick,
             next_update: Instant::now() + tick,
+            food_tick,
+            next_food: Instant::now() + food_tick,
             fps_update: Cell::new(Instant::now()),
             width: 15,
             height: 15,
@@ -166,20 +191,60 @@ impl State {
         }
     }
 
-    fn update(&mut self) {
+    fn update(&mut self) -> bool {
         if Instant::now() > self.next_update {
-            self.step();
+            if self.step() {
+                return true;
+            }
             self.next_update = Instant::now() + self.tick;
         }
+
+        if self.food.is_empty() || Instant::now() > self.next_food {
+            if self.add_food() {
+                return true;
+            }
+            self.next_food = Instant::now() + self.food_tick;
+        }
+
+        false
     }
 
-    fn step(&mut self) {
+    fn step(&mut self) -> bool {
+        let new_head = self.head + self.v;
+
+        if new_head.0 < 0 || new_head.0 >= self.width ||
+           new_head.1 < 0 || new_head.1 >= self.height ||
+           self.tail[0..self.tail.len() - 1].contains(&new_head) {
+            return true;
+        }
+
+        if self.food.contains(&new_head) {
+            self.tail.push(Vec2(0, 0));
+            self.food.remove(&new_head);
+        }
+
         for i in (0..(self.tail.len() - 1)).rev() {
             self.tail[i + 1] = self.tail[i];
         }
         self.tail[0] = self.head;
         self.head += self.v;
-        // info!("{:?} {:?}", self.head, self.tail);
+        false
+    }
+
+    fn add_food(&mut self) -> bool {
+        let total_nodes = self.width * self.height;
+        if self.tail.len() + self.food.len() + 2 >= total_nodes as usize {
+            return true;
+        }
+
+        loop {
+            let idx = rand::thread_rng().gen_range(0..total_nodes);
+            let pos = Vec2(idx % self.width, idx / self.width);
+            if !self.food.contains(&pos) && !self.tail.contains(&pos) && pos != self.head {
+                self.food.insert(pos);
+                return false;
+            }
+        }
     }
 
     fn render(&self, canvas: &mut Canvas) {
@@ -188,9 +253,40 @@ impl State {
         for pos in self.tail.iter() {
             canvas.set_pixel(pos.0, pos.1, TAIL_COLOR);
         }
+        for pos in self.food.iter() {
+            canvas.set_pixel(pos.0, pos.1, FOOD_COLOR);
+        }
         if Instant::now() > self.fps_update.get() {
             info!("FPS: {}", canvas.fps());
             self.fps_update.set(Instant::now() + Duration::from_secs(1))
+        }
+    }
+
+    fn on_keypress(&mut self, keycode: VirtualKeyCode) {
+        match keycode {
+            VirtualKeyCode::Right => {
+                self.v = Vec2(1, 0);
+            }
+            VirtualKeyCode::Up => {
+                self.v = Vec2(0, 1);
+            }
+            VirtualKeyCode::Left => {
+                self.v = Vec2(-1, 0);
+            }
+            VirtualKeyCode::Down => {
+                self.v = Vec2(0, -1);
+            }
+            _ => (),
+        }
+    }
+}
+
+fn handle_keypress(keycode: VirtualKeyCode, state: &mut State) -> Option<ControlFlow> {
+    match keycode {
+        VirtualKeyCode::Escape => Some(ControlFlow::Exit),
+        x => {
+            state.on_keypress(x);
+            None
         }
     }
 }
@@ -206,18 +302,20 @@ fn handle_event<T: std::fmt::Debug + 'static>(
             Some(ControlFlow::Poll)
         }
         Event::NewEvents(StartCause::Poll) | Event::NewEvents(StartCause::WaitCancelled { .. }) => {
-            state.update();
+            if state.update() {
+                return Some(ControlFlow::Exit)
+            }
             state.render(canvas);
             if canvas.draw().is_err() {
                 Some(ControlFlow::Exit)
             } else {
                 None
             }
-        },
+        }
         Event::NewEvents(_) => {
             debug!("Event: {:?}", event);
             None
-        },
+        }
         Event::WindowEvent {
             event: window_event,
             ..
@@ -230,18 +328,16 @@ fn handle_event<T: std::fmt::Debug + 'static>(
                     None
                 }
                 WindowEvent::CloseRequested => Some(ControlFlow::Exit),
-                WindowEvent::KeyboardInput { input, .. } => {
-                    if let KeyboardInput {
-                        virtual_keycode: Some(VirtualKeyCode::Escape),
-                        state: ElementState::Pressed,
-                        ..
-                    } = input
-                    {
-                        Some(ControlFlow::Exit)
-                    } else {
-                        None
-                    }
-                }
+                WindowEvent::KeyboardInput {
+                    input:
+                        KeyboardInput {
+                            virtual_keycode: Some(keycode),
+                            state: ElementState::Pressed,
+                            ..
+                        },
+                    ..
+                } => handle_keypress(*keycode, state),
+                WindowEvent::KeyboardInput { .. } => None,
                 _ => None,
             }
         }
